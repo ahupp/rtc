@@ -1,17 +1,21 @@
-use std::{collections::HashMap, convert::Infallible, fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap, convert::Infallible, fs, net::SocketAddr, path::PathBuf, sync::Arc,
+};
 
-use hyper::{client::HttpConnector, service::service_fn, Body, Client, Request, Response, Uri};
 use bytes::Bytes;
+use hyper::{client::HttpConnector, service::service_fn, Body, Client, Request, Response, Uri};
 use moka::future::Cache;
-use sha2::{Digest, Sha256};
+use prost::Message;
 use prost_reflect::DescriptorPool;
+use prost_types::FileDescriptorSet;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 pub struct ProxyConfig {
-    pub descriptor_path: PathBuf,
+    pub descriptor_root: PathBuf,
     pub listen: SocketAddr,
     pub default: Uri,
-    pub routes: HashMap<String, Uri>,
 }
 
 struct ProxyState {
@@ -36,7 +40,10 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
     let path = req.uri().path().to_string();
 
     if !method_exists(&state.pool, &path) {
-        let resp = Response::builder().status(404).body(Body::from("unknown method")).unwrap();
+        let resp = Response::builder()
+            .status(404)
+            .body(Body::from("unknown method"))
+            .unwrap();
         return Ok(resp);
     }
 
@@ -80,16 +87,60 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
     }
 }
 
+#[derive(Deserialize)]
+struct ServiceYaml {
+    route: String,
+}
+
 pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = fs::read(config.descriptor_path)?;
-    let pool = DescriptorPool::decode(bytes.as_slice())?;
+    let mut pool = DescriptorPool::new();
+    let mut routes = HashMap::new();
+
+    for entry in fs::read_dir(&config.descriptor_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let dir_path = entry.path();
+        let descriptor_path = dir_path.join("descriptor.bin");
+        let yaml_path = dir_path.join("config.yaml");
+        if !descriptor_path.exists() || !yaml_path.exists() {
+            continue;
+        }
+
+        let bytes = fs::read(&descriptor_path)?;
+        pool.decode_file_descriptor_set(bytes.as_slice())?;
+
+        let yaml_str = fs::read_to_string(&yaml_path)?;
+        let svc: ServiceYaml = serde_yaml::from_str(&yaml_str)?;
+        let uri: Uri = svc.route.parse()?;
+
+        let fds: FileDescriptorSet = FileDescriptorSet::decode(bytes.as_slice())?;
+        for file in &fds.file {
+            let package = file.package.as_deref().unwrap_or("");
+            for service in &file.service {
+                let svc_name = service.name.as_deref().unwrap_or("");
+                let full_service = if package.is_empty() {
+                    svc_name.to_string()
+                } else {
+                    format!("{}.{}", package, svc_name)
+                };
+                for method in &service.method {
+                    let method_name = method.name.as_deref().unwrap_or("");
+                    let path = format!("/{}/{}", full_service, method_name);
+                    routes.insert(path, uri.clone());
+                }
+            }
+        }
+    }
 
     let client = Client::builder().http2_only(true).build_http();
     let cache = Cache::new(1024);
 
     let state = Arc::new(ProxyState {
         client,
-        routes: config.routes,
+        routes,
         default: config.default,
         pool,
         cache,
@@ -111,4 +162,3 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error 
         });
     }
 }
-
