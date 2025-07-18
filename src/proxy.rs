@@ -5,6 +5,16 @@ use std::{
 use bytes::Bytes;
 use hyper::{client::HttpConnector, service::service_fn, Body, Client, Request, Response, Uri};
 use moka::future::Cache;
+
+use std::time::SystemTime;
+
+#[derive(Clone)]
+struct CacheEntry {
+    body: Bytes,
+    service: String,
+    method: String,
+    created: SystemTime,
+}
 use prost::Message;
 use prost_reflect::DescriptorPool;
 use prost_types::FileDescriptorSet;
@@ -23,7 +33,7 @@ struct ProxyState {
     routes: HashMap<String, Uri>,
     default: Uri,
     pool: DescriptorPool,
-    cache: Cache<Vec<u8>, Bytes>,
+    cache: Cache<Vec<u8>, CacheEntry>,
 }
 
 fn method_exists(pool: &DescriptorPool, path: &str) -> bool {
@@ -38,6 +48,12 @@ fn method_exists(pool: &DescriptorPool, path: &str) -> bool {
 
 async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
+    let trimmed = path.trim_start_matches('/');
+    let (service, method) = trimmed
+        .split_once('/')
+        .expect("validated service and method");
+    let service = service.to_string();
+    let method = method.to_string();
 
     if !method_exists(&state.pool, &path) {
         let resp = Response::builder()
@@ -58,7 +74,7 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
     if let Some(cached) = state.cache.get(&key).await {
         let resp = Response::builder()
             .status(200)
-            .body(Body::from(cached))
+            .body(Body::from(cached.body.clone()))
             .unwrap();
         return Ok(resp);
     }
@@ -73,7 +89,18 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
         Ok(resp) => {
             let (mut parts, body) = resp.into_parts();
             let bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
-            state.cache.insert(key, bytes.clone()).await;
+            state
+                .cache
+                .insert(
+                    key,
+                    CacheEntry {
+                        body: bytes.clone(),
+                        service: service.clone(),
+                        method: method.clone(),
+                        created: SystemTime::now(),
+                    },
+                )
+                .await;
             let resp = Response::from_parts(parts, Body::from(bytes));
             Ok(resp)
         }
