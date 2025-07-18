@@ -1,0 +1,18 @@
+[package]
+name = "rtc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tonic = { version = "0.11", features = ["transport"] }
+prost = "0.12"
+prost-reflect = "0.12"
+clap = { version = "4", features = ["derive"] }
+hyper = { version = "0.14", features = ["full"] }
+bytes = "1"
+moka = { version = "0.12", features = ["future"] }
+sha2 = "0.10"
+
+[build-dependencies]
+tonic-build = "0.11"
