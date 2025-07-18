@@ -81,11 +81,16 @@ async fn response_with_trailers(body: Bytes, deps: &[String]) -> Response<Body> 
 async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
     let trimmed = path.trim_start_matches('/');
-    let (service, method) = trimmed
-        .split_once('/')
-        .expect("validated service and method");
-    let service = service.to_string();
-    let method = method.to_string();
+    let (service, method) = match trimmed.split_once('/') {
+        Some((svc, m)) => (svc.to_string(), m.to_string()),
+        None => {
+            let resp = Response::builder()
+                .status(404)
+                .body(Body::from("malformed path"))
+                .unwrap();
+            return Ok(resp);
+        }
+    };
 
     if !method_exists(&state.pool, &path) {
         let resp = Response::builder()
