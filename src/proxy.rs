@@ -71,37 +71,39 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
     hasher.update(&full_body);
     let key: Vec<u8> = hasher.finalize().to_vec();
 
-    if let Some(cached) = state.cache.get(&key).await {
-        let resp = Response::builder()
-            .status(200)
-            .body(Body::from(cached.body.clone()))
-            .unwrap();
-        return Ok(resp);
-    }
+    let client = state.client.clone();
+    let entry_result = state
+        .cache
+        .try_get_with_by_ref(&key, async move {
+            let mut new_parts = parts;
+            let mut new_uri_parts = new_parts.uri.into_parts();
+            new_uri_parts.scheme = uri.scheme().cloned();
+            new_uri_parts.authority = uri.authority().cloned();
+            new_parts.uri = Uri::from_parts(new_uri_parts).expect("valid uri");
+            let new_req = Request::from_parts(new_parts, Body::from(full_body.clone()));
 
-    let mut new_uri_parts = parts.uri.into_parts();
-    new_uri_parts.scheme = uri.scheme().cloned();
-    new_uri_parts.authority = uri.authority().cloned();
-    parts.uri = Uri::from_parts(new_uri_parts).expect("valid uri");
-    let new_req = Request::from_parts(parts, Body::from(full_body.clone()));
-
-    match state.client.request(new_req).await {
-        Ok(resp) => {
-            let (mut parts, body) = resp.into_parts();
-            let bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
-            state
-                .cache
-                .insert(
-                    key,
-                    CacheEntry {
-                        body: bytes.clone(),
+            match client.request(new_req).await {
+                Ok(resp) => {
+                    let (_parts, body) = resp.into_parts();
+                    let bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+                    Ok(CacheEntry {
+                        body: bytes,
                         service: service.clone(),
                         method: method.clone(),
                         created: SystemTime::now(),
-                    },
-                )
-                .await;
-            let resp = Response::from_parts(parts, Body::from(bytes));
+                    })
+                }
+                Err(err) => Err(err),
+            }
+        })
+        .await;
+
+    match entry_result {
+        Ok(cached) => {
+            let resp = Response::builder()
+                .status(200)
+                .body(Body::from(cached.body.clone()))
+                .unwrap();
             Ok(resp)
         }
         Err(err) => {
