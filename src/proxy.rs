@@ -3,10 +3,12 @@ use std::{
 };
 
 use bytes::Bytes;
+use http::HeaderMap;
 use hyper::{client::HttpConnector, service::service_fn, Body, Client, Request, Response, Uri};
 use moka::future::Cache;
 
 use std::time::SystemTime;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -14,6 +16,7 @@ struct CacheEntry {
     service: String,
     method: String,
     created: SystemTime,
+    deps: Vec<String>,
 }
 use prost::Message;
 use prost_reflect::DescriptorPool;
@@ -34,6 +37,7 @@ struct ProxyState {
     default: Uri,
     pool: DescriptorPool,
     cache: Cache<Vec<u8>, CacheEntry>,
+    deps: tokio::sync::Mutex<HashMap<String, Vec<Vec<u8>>>>,
 }
 
 fn method_exists(pool: &DescriptorPool, path: &str) -> bool {
@@ -44,6 +48,34 @@ fn method_exists(pool: &DescriptorPool, path: &str) -> bool {
         }
     }
     false
+}
+
+async fn collect_body_and_trailers(mut body: Body) -> (Bytes, Option<HeaderMap>) {
+    use hyper::body::HttpBody;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        if let Ok(chunk) = chunk {
+            bytes.extend_from_slice(&chunk);
+        } else {
+            break;
+        }
+    }
+    let trailers = body.trailers().await.ok().flatten();
+    (Bytes::from(bytes), trailers)
+}
+
+async fn response_with_trailers(body: Bytes, deps: &[String]) -> Response<Body> {
+    let (mut tx, body_stream) = Body::channel();
+    let mut trailers = HeaderMap::new();
+    for dep in deps {
+        if let Ok(val) = dep.parse() {
+            trailers.append("x-rtc-dep", val);
+        }
+    }
+    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+    let _ = tx.try_send_data(body);
+    let _ = tx.send_trailers(trailers).await;
+    Response::builder().status(200).body(body_stream).unwrap()
 }
 
 async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<Body>, Infallible> {
@@ -72,6 +104,8 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
     let key: Vec<u8> = hasher.finalize().to_vec();
 
     let client = state.client.clone();
+    let state_clone = state.clone();
+    let key_for_map = key.clone();
     let entry_result = state
         .cache
         .try_get_with_by_ref(&key, async move {
@@ -85,12 +119,29 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
             match client.request(new_req).await {
                 Ok(resp) => {
                     let (_parts, body) = resp.into_parts();
-                    let bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
+                    let (bytes, trailers) = collect_body_and_trailers(body).await;
+                    let cache_key = key_for_map.clone();
+                    let deps: Vec<String> = trailers
+                        .as_ref()
+                        .map(|t| {
+                            t.get_all("x-rtc-dep")
+                                .iter()
+                                .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !deps.is_empty() {
+                        let mut map = state_clone.deps.lock().await;
+                        for dep in &deps {
+                            map.entry(dep.clone()).or_default().push(cache_key.clone());
+                        }
+                    }
                     Ok(CacheEntry {
                         body: bytes,
                         service: service.clone(),
                         method: method.clone(),
                         created: SystemTime::now(),
+                        deps,
                     })
                 }
                 Err(err) => Err(err),
@@ -100,10 +151,7 @@ async fn handle(req: Request<Body>, state: Arc<ProxyState>) -> Result<Response<B
 
     match entry_result {
         Ok(cached) => {
-            let resp = Response::builder()
-                .status(200)
-                .body(Body::from(cached.body.clone()))
-                .unwrap();
+            let resp = response_with_trailers(cached.body.clone(), &cached.deps).await;
             Ok(resp)
         }
         Err(err) => {
@@ -173,6 +221,7 @@ pub async fn serve(config: ProxyConfig) -> Result<(), Box<dyn std::error::Error 
         default: config.default,
         pool,
         cache,
+        deps: Mutex::new(HashMap::new()),
     });
 
     let listener = TcpListener::bind(config.listen).await?;
